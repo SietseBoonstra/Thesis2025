@@ -201,11 +201,10 @@ def simulate(n, scenario, room_name, process, cfg, rooms, seed=None):
         df['T_form_each'] = assign_sp
     df['T_setup'] = T_setup
     df = compute_group_travel_time(df, room, scenario)
-    occupancy = n / room['capacity']
-    gamma = 0.4  # adjust as needed, 0.25-0.5 is realistic for big rooms
-    if occupancy > 0.7:  # only apply if more than 70% full
-        crowding_factor = 1 + gamma * (occupancy - 0.7) / 0.3  # linearly up to +gamma at full
-        df['T_find'] *= crowding_factor
+    baseline = 30
+    gamma = 0.1
+    crowding_factor = 1 + gamma * (len(df) - baseline) / baseline
+    df['T_find'] *= crowding_factor
     df['T_total'] = df['T_setup'] + df['T_form_each'] + df['T_find']
     if process == 'self':
         T_form = df['T_form_each'].max()
@@ -360,4 +359,3 @@ if __name__ == "__main__":
 
     for room_name, room in ROOMS.items():
         plot_seat_layout(room, room_name)
-

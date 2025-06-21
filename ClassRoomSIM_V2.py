@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from collections import Counter
 from scipy.stats import norm
 import seaborn as sns
+import itertools
 
 # ———— Configuration ————
 CFG = {
@@ -24,9 +25,9 @@ CFG = {
     },
     'visualization_sample_size': 30,
     'pilot_reps': 50,
-    'epsilon': 0.1,
+    'epsilon': 0.01,
     'alpha': 0.05,
-    'K': 1
+    'K': 3
 }
 
 SCENARIOS = {
@@ -321,46 +322,53 @@ def simulate(n, scenario, process, cfg, rooms, seed=None):
     df['T_grouping'] = T_grouping
     return df
 
-
-
 # --- Estimate N_required from pilot (this section is fine) ---
-
-pilot_reps = 10
+methods = ['old', 'new', 'sim']
+method_pairs = list(itertools.combinations(methods, 2))  # [('old','new'), ('old','sim'), ('new','sim')]
+pilot_reps = 50
 alpha = CFG['alpha']
 epsilon = CFG['epsilon']
 K = CFG['K']
 z_star = norm.ppf(1 - alpha / (2 * K))
-deltas = []
+
+# Dictionary to collect deltas for each pair
+pair_deltas = {pair: [] for pair in method_pairs}
 
 for rep in range(pilot_reps):
     for scenario, sizes in SCENARIOS.items():
         for n in sizes:
-            # Use different random seeds for old and new to ensure diversity
-            old_seed = rep * 100000 + n * 1000 + 1
-            new_seed = rep * 100000 + n * 1000 + 2
-            df_old = simulate(n, scenario, 'old', CFG, ROOMS, seed=old_seed)
-            df_new = simulate(n, scenario, 'new', CFG, ROOMS, seed=new_seed)
+            # Simulate all 3 methods for this scenario/class size
+            dfs = {}
+            for method in methods:
+                seed = rep * 100000 + n * 1000 + hash(method) % 1000  # unique seed per method
+                dfs[method] = simulate(n, scenario, method, CFG, ROOMS, seed=seed)
 
-            old_grp = df_old.groupby('group_id').agg(
-                H_num=('motivation', lambda x: normalize_std(numeric_heterogeneity(df_old.loc[x.index]))),
-                H_top=('topic', lambda x: normalize_blau(topic_heterogeneity(x), k=4)),
-                T_grouping=('T_grouping', 'first')
-            ).reset_index()
-            new_grp = df_new.groupby('group_id').agg(
-                H_num=('motivation', lambda x: normalize_std(numeric_heterogeneity(df_new.loc[x.index]))),
-                H_top=('topic', lambda x: normalize_blau(topic_heterogeneity(x), k=4)),
-                T_grouping=('T_grouping', 'first')
-            ).reset_index()
-            weight_h_top = CFG['heterogeneity_weights']['topic']
-            weight_h_num = CFG['heterogeneity_weights']['numeric']
-            old_het = weight_h_top * old_grp['H_top'].mean() + weight_h_num * old_grp['H_num'].mean()
-            new_het = weight_h_top * new_grp['H_top'].mean() + weight_h_num * new_grp['H_num'].mean()
-            diff = new_het - old_het
-            deltas.append(diff)
+            # Compute weighted heterogeneity for each method
+            hets = {}
+            for method, df in dfs.items():
+                grp = df.groupby('group_id').agg(
+                    H_num=('motivation', lambda x: normalize_std(numeric_heterogeneity(df.loc[x.index]))),
+                    H_top=('topic', lambda x: normalize_blau(topic_heterogeneity(x), k=4))
+                ).reset_index()
+                weight_h_top = CFG['heterogeneity_weights']['topic']
+                weight_h_num = CFG['heterogeneity_weights']['numeric']
+                hets[method] = weight_h_top * grp['H_top'].mean() + weight_h_num * grp['H_num'].mean()
 
-sigma_hat = np.std(deltas, ddof=1)
-N_required = int(np.ceil((z_star * sigma_hat / epsilon) ** 2))
-print(f"N_required: {N_required}")
+            # Store the difference for each pair
+            for pair in method_pairs:
+                diff = hets[pair[1]] - hets[pair[0]]
+                pair_deltas[pair].append(diff)
+
+# Compute sigma_hat and N_required for each pair, and get the maximum
+N_list = []
+for pair in method_pairs:
+    sigma_hat = np.std(pair_deltas[pair], ddof=1)
+    N_required = int(np.ceil((z_star * sigma_hat / epsilon) ** 2))
+    print(f"N_required for {pair[1]} vs {pair[0]}: {N_required}")
+    N_list.append(N_required)
+
+ultimate_N_required = max(N_list)
+print(f"\nUltimate N_required to power all pairwise comparisons: {ultimate_N_required}")
 
 # --- Main simulation ---
 all_results = []
@@ -369,7 +377,7 @@ all_results_time = []
 for scenario, sizes in SCENARIOS.items():
     for n in sizes:
         for process in ('old', 'new', 'sim'):
-            for rep in range(max(N_required, 100)):
+            for rep in range(ultimate_N_required):
                 df = simulate(n, scenario, process, CFG, ROOMS, seed=None)
                 T_grouping = df['T_grouping'].iloc[0]
                 grp = df.groupby('group_id')
@@ -420,29 +428,6 @@ for scenario, sizes in SCENARIOS.items():
 
 dfg = pd.concat(all_results, ignore_index=True)
 df_time = pd.concat(all_results_time, ignore_index=True)
-
-# --- 4. Stacked bar plot for specific scenario/class size ---
-scenario_filter = 'large_lecture'
-n_filter = 80
-df_case = df_time[
-    (df_time['scenario'] == scenario_filter) &
-    (df_time['n_students'] == n_filter)
-]
-time_components = (
-    df_case
-    .groupby('process')[['T_setup', 'T_assign', 'T_form', 'T_find']]
-    .mean()
-    .reset_index()
-)
-time_components.set_index('process')[['T_setup', 'T_assign', 'T_form', 'T_find']].plot(
-    kind='bar', stacked=True, figsize=(8, 5), rot=0
-)
-plt.title(f"Average Grouping Time Components — {scenario_filter.replace('_',' ').title()} (n = {n_filter})")
-plt.ylabel("Time (seconds)")
-plt.xlabel("Grouping Method")
-plt.grid(True)
-plt.tight_layout()
-plt.show()
 
 # Example settings
 scenario = 'large_lecture'
@@ -529,7 +514,7 @@ all_results_time_hetero = []
 for scenario, sizes in SCENARIOS.items():
     for n in sizes:
         for process in ('hetero_new', 'hetero_sim'):
-            for rep in range(max(N_required, 100)):
+            for rep in range(ultimate_N_required):
                 # Simulate class (same as before, but use custom grouping below)
                 df = simulate(n, scenario, 'new' if process == 'hetero_new' else 'sim', CFG, ROOMS, seed=None)
 
@@ -716,6 +701,8 @@ for scenario in df_time_both['scenario'].unique():
             linestyle=linestyle_map[process],
             label=process_labels.get(process, process)
         )
+    if scenario == 'large_lecture':
+        plt.axhline(y=300, color='black', linewidth=3, linestyle='--')
     plt.title(f"Total Grouping Time — {scenario.replace('_',' ').title()}")
     plt.xlabel("Class Size")
     plt.ylabel("Total Grouping Time (seconds)")
@@ -727,17 +714,6 @@ for scenario in df_time_both['scenario'].unique():
 # Concatenate homogeneous and heterogeneous results (after renaming 'process' as above)
 dfg_box = pd.concat([dfg, dfg_hetero], ignore_index=True)
 dfg_box['process'] = dfg_box['process'].map(process_map)
-
-# --- Heterogeneity boxplot for each scenario ---
-for scenario_name in dfg_box['scenario'].unique():
-    plt.figure(figsize=(10,6))
-    subset = dfg_box[dfg_box['scenario'] == scenario_name]
-    sns.boxplot(data=subset, x='process', y='H_overall', showmeans=True)
-    plt.title(f"Total Heterogeneity by Process\n({scenario_name.replace('_',' ').title()})")
-    plt.xlabel("Process")
-    plt.ylabel("Total Heterogeneity")
-    plt.tight_layout()
-    plt.show()
 
 for scenario_name in dfg_box['scenario'].unique():
     plt.figure(figsize=(14,6))
@@ -752,17 +728,6 @@ for scenario_name in dfg_box['scenario'].unique():
 
 df_time_box = pd.concat([df_time, df_time_hetero], ignore_index=True)
 df_time_box['process'] = df_time_box['process'].map(process_map)
-
-# By scenario
-for scenario_name in df_time_box['scenario'].unique():
-    plt.figure(figsize=(10,6))
-    subset = df_time_box[df_time_box['scenario'] == scenario_name]
-    sns.boxplot(data=subset, x='process', y='T_grouping', showmeans=True)
-    plt.title(f"Grouping Time by Process\n({scenario_name.replace('_',' ').title()})")
-    plt.xlabel("Process")
-    plt.ylabel("Grouping Time (seconds)")
-    plt.tight_layout()
-    plt.show()
 
 for scenario_name in df_time_box['scenario'].unique():
     plt.figure(figsize=(14,6))
