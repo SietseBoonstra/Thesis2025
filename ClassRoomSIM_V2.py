@@ -23,7 +23,6 @@ CFG = {
         'numeric': 2/3,
         'topic':   1/3,
     },
-    'visualization_sample_size': 30,
     'pilot_reps': 50,
     'epsilon': 0.01,
     'alpha': 0.05,
@@ -47,76 +46,149 @@ TOPIC_MAP = {t: [int(i == j) for j in range(len(TOPICS))] for i, t in enumerate(
 
 # ———— Distance Modeling ————
 def compute_group_travel_time(df, scenario):
+    """
+    Computes the travel time for each student in a group to reach the group anchor,
+    based on the classroom scenario and student positions.
+
+    Parameters:
+        df (DataFrame): DataFrame containing student positions ('x', 'y').
+        scenario (str): Classroom scenario, e.g., 'workshop', 'small_tutorial', 'large_lecture'.
+
+    Returns:
+        Travel distance according to the group assignment.
+    """
+    # Helper function to compute distance between two points based on scenario
     def compute_distance(x1, y1, x2, y2):
         if scenario == 'workshop':
+            # Use Euclidean distance for open spaces (no barriers)
             return np.sqrt((x1 - x2)**2 + (y1 - y2)**2)
         elif scenario == 'small_tutorial':
+            # Use Manhattan distance for simple row/column layouts (movement only along axes)
             return np.abs(x1 - x2) + np.abs(y1 - y2)
         elif scenario == 'large_lecture':
+            # Simulate complex movement in lecture halls (e.g., walking to aisle, then to seat)
             return x1 + x2 + np.abs(y1 - y2)
         else:
+            # Default to Manhattan distance
             return np.abs(x1 - x2) + np.abs(y1 - y2)
 
     def find_best_anchor(group_df):
-        min_total_time = float('inf')
+        """
+        Finds the 'anchor' student in the group for which the total travel time of all group members
+        to reach them is minimized. The anchor is the most 'central' student, minimizing total walking time.
+
+        Parameters:
+            group_df (DataFrame): Subset of the main DataFrame for a single group.
+
+        Returns:
+            best_idx (int): Index of the anchor student within the group.
+        """
+        min_total_time = float('inf')  # Initialize with a very large value
         best_idx = None
+        # Try every student in the group as potential anchor
         for idx, anchor in group_df.iterrows():
             total_time = 0
+            # Sum up travel times for all students to this anchor
             for _, stu in group_df.iterrows():
                 dist = compute_distance(stu['x'], stu['y'], anchor['x'], anchor['y'])
                 travel_time = dist / stu['speed']
                 total_time += travel_time
+            # Keep track of the anchor with the lowest total travel time
             if total_time < min_total_time:
                 min_total_time = total_time
                 best_idx = idx
         return best_idx
 
-    df['T_find'] = 0.0
+    # For each group in the DataFrame, compute travel times
+    df['T_find'] = 0.0  # Initialize new column for maximum time to reach group anchor
     for gid, group_df in df.groupby('group_id'):
-        best_idx = find_best_anchor(group_df)
+        best_idx = find_best_anchor(group_df)  # Find the optimal anchor for this group
         anchor = group_df.loc[best_idx]
         t_find = []
+        # For each student, calculate time needed to reach the anchor
         for idx, stu in group_df.iterrows():
             dist = compute_distance(stu['x'], stu['y'], anchor['x'], anchor['y'])
             travel_time = dist / stu['speed']
             t_find.append(travel_time)
+        # The group 'find' time is the maximum travel time among all group members
         max_time = max(t_find)
-        df.loc[group_df.index, 'T_find'] = max_time
+        df.loc[group_df.index, 'T_find'] = max_time  # Assign to all students in the group
 
-    return df
+    return df  # Return DataFrame with T_find column updated
 
 # ———— Helpers ————
 def make_seats(n, room):
-    w,h = room['area']; rows=room['rows']
+    """
+    Assigns seat (x, y) coordinates to each student based on room layout.
+    If rows are specified, students are assigned in a regular grid; otherwise, positions are random.
+
+    Parameters:
+        n (int): Number of students
+        room (dict): Room layout, should contain 'area' (width, height) and optionally 'rows'
+
+    Returns:
+        List of (x, y) seat positions, one per student
+    """
+    w, h = room['area']  # width and height of the room
+    rows = room['rows']  # number of rows (may be None)
     if rows:
-        cols = math.ceil(n/rows)
-        xs = np.linspace(0,w,cols); ys = np.linspace(0,h,rows)
-        pts = [(x,y) for y in ys for x in xs]
-        return pts[:n]
-    xs = np.random.uniform(0,w,n); ys = np.random.uniform(0,h,n)
-    return list(zip(xs,ys))
+        # Arrange students in a grid if number of rows is specified
+        cols = math.ceil(n / rows)  # Number of columns needed
+        xs = np.linspace(0, w, cols)  # Evenly spaced x-positions (columns)
+        ys = np.linspace(0, h, rows)  # Evenly spaced y-positions (rows)
+        pts = [(x, y) for y in ys for x in xs]  # All grid coordinates
+        return pts[:n]  # Return only as many as needed
+    # If no rows specified, scatter students randomly in the room
+    xs = np.random.uniform(0, w, n)
+    ys = np.random.uniform(0, h, n)
+    return list(zip(xs, ys))
+
 
 def pairwise_similarity(s1, s2):
+    """
+    Calculates the negative Euclidean distance between two students' attribute vectors.
+    Attributes used: motivation, preparation, and topic vector.
+    Higher score means more similar.
+
+    Parameters:
+        s1, s2 (dict): Dictionaries of student attributes
+
+    Returns:
+        float: Negative Euclidean distance (higher is more similar)
+    """
     v1 = np.array([s1['motivation'], s1['preparation']] + TOPIC_MAP[s1['topic']])
     v2 = np.array([s2['motivation'], s2['preparation']] + TOPIC_MAP[s2['topic']])
     return -np.linalg.norm(v1 - v2)
 
+
 def similarity_grouping(students, group_size=4, group_sizes=None, homogeneous=True):
     """
-    Forms groups by similarity/dissimilarity, supporting either a fixed group_size (old) or a list of group_sizes (preferred).
+    Forms groups of students based on similarity or dissimilarity.
+    Can use a fixed group size or a list of group sizes.
+
+    Parameters:
+        students (list): List of student dictionaries
+        group_size (int): Size of each group (if group_sizes not given)
+        group_sizes (list): List of group sizes (optional, preferred for uneven divisions)
+        homogeneous (bool): If True, groups are similar (maximize similarity);
+                            if False, groups are diverse (minimize similarity)
+
+    Returns:
+        List of groups (each group is a list of student dicts)
     """
     n = len(students)
     sim = np.zeros((n, n))
+    # Calculate similarity for every student pair
     for i in range(n):
-        for j in range(i+1, n):
+        for j in range(i + 1, n):
             s = pairwise_similarity(students[i], students[j])
             sim[i, j] = s
             sim[j, i] = s
 
-    unassigned = set(range(n))
+    unassigned = set(range(n))  # Indexes of students not yet grouped
     groups = []
 
-    # Decide group sizes
+    # Decide group sizes to use for this run
     if group_sizes is not None:
         sizes = group_sizes.copy()
     else:
@@ -129,31 +201,37 @@ def similarity_grouping(students, group_size=4, group_sizes=None, homogeneous=Tr
     for sz in sizes:
         if not unassigned:
             break
-        # Start with the pair with max/min similarity
+        # Find the pair with the max/min similarity (depending on homogeneous/heterogeneous)
         pairs = [(i, j, sim[i, j]) for i in unassigned for j in unassigned if i < j]
         if not pairs:
+            # If only one or zero unassigned, add them as a group and break
             leftover = list(unassigned)
             groups.append([students[idx] for idx in leftover])
             unassigned = set()
             break
 
+        # Key function depends on desired grouping: maximize similarity for homogeneous, minimize for heterogeneous
         key = (lambda x: x[2]) if homogeneous else (lambda x: -x[2])
-        i0, j0, _ = max(pairs, key=key)
+        i0, j0, _ = max(pairs, key=key)  # Start group with best matching pair
         group_idxs = {i0, j0}
         unassigned.remove(i0)
         unassigned.remove(j0)
 
+        # Add more members to the group, one by one, choosing the student whose average similarity to group is best
         while len(group_idxs) < sz and unassigned:
             scores = []
             for u in unassigned:
                 avg_sim = np.mean([sim[u, g] for g in group_idxs])
                 scores.append((u, avg_sim))
+            # Again, maximize or minimize average similarity
             u_pick, _ = max(scores, key=(lambda x: x[1]) if homogeneous else (lambda x: -x[1]))
             group_idxs.add(u_pick)
             unassigned.remove(u_pick)
 
+        # Form the group
         groups.append([students[i] for i in group_idxs])
 
+    # If any students remain, group them together as a last group
     if unassigned:
         groups.append([students[i] for i in unassigned])
 
@@ -245,41 +323,106 @@ def random_group_ids(n, group_sz=None, group_sizes=None):
             gids[student_idx] = i // group_sz
     return gids
 
+
 def numeric_heterogeneity(g):
+    """
+    Computes numeric heterogeneity within a group.
+    Heterogeneity is defined as the standard deviation across all motivation and preparation values in the group.
+
+    Parameters:
+        g (pd.DataFrame): Group data containing 'motivation' and 'preparation' columns
+
+    Returns:
+        float: Standard deviation across all numeric attributes
+    """
     vals = np.concatenate([g['motivation'].values, g['preparation'].values])
-    return np.sqrt(np.mean((vals - vals.mean())**2))
+    return np.sqrt(np.mean((vals - vals.mean()) ** 2))
+
 
 def topic_heterogeneity(ts):
-    freqs = np.array(list(Counter(ts).values()), float)
-    ps = freqs / freqs.sum()
-    return 1 - np.sum(ps**2)
+    """
+    Computes topic heterogeneity (Blau index) for a group.
+    The Blau index reflects how evenly topics are distributed within the group (higher means more diverse).
+
+    Parameters:
+        ts (iterable): List or array of topic assignments
+
+    Returns:
+        float: Blau index (0 = all same topic, up to ~1 for perfectly diverse)
+    """
+    freqs = np.array(list(Counter(ts).values()), float)  # Count frequency of each topic
+    ps = freqs / freqs.sum()  # Proportion of each topic
+    return 1 - np.sum(ps ** 2)  # Blau index formula
+
 
 def normalize_std(std_val, scale_min=1, scale_max=5):
-    max_std = (scale_max - scale_min) / 2
+    """
+    Normalizes a standard deviation value to [0, 1] based on known input range.
+
+    Parameters:
+        std_val (float): Standard deviation value to normalize
+        scale_min (int): Minimum possible value (default 1)
+        scale_max (int): Maximum possible value (default 5)
+
+    Returns:
+        float: Normalized standard deviation
+    """
+    max_std = (scale_max - scale_min) / 2  # Theoretical maximum std deviation for this scale
     return std_val / max_std if max_std != 0 else 0
 
+
 def normalize_blau(blau_val, k):
-    max_blau = 1 - 1/k if k > 1 else 0
+    """
+    Normalizes the Blau index to [0, 1] given the number of categories (topics).
+
+    Parameters:
+        blau_val (float): Blau index value
+        k (int): Number of categories (topics)
+
+    Returns:
+        float: Normalized Blau index
+    """
+    max_blau = 1 - 1 / k if k > 1 else 0  # Theoretical max Blau index for k categories
     return blau_val / max_blau if max_blau != 0 else 0
 
+
 def simulate(n, scenario, process, cfg, rooms, seed=None):
+    """
+    Runs a full simulation for one scenario and process, returning a DataFrame with all relevant information.
+
+    Parameters:
+        n (int): Number of students
+        scenario (str): Scenario key for room/settings
+        process (str): Which grouping process ('new', 'sim', or manual/random)
+        cfg (dict): Configuration dictionary
+        rooms (dict): Dictionary of room layouts
+        seed (int): Optional random seed for reproducibility
+
+    Returns:
+        pd.DataFrame: Student-level results including group membership and timing
+    """
+    # Set random seed if provided for reproducibility
     if seed is not None:
         np.random.seed(seed)
         random.seed(seed)
 
+    # Generate seat positions for all students in the chosen room/scenario
     seats = make_seats(n, rooms[scenario])
-    df = pd.DataFrame({
-        'student_id':   np.arange(n),
-        'motivation':   np.random.randint(1,6,n),
-        'preparation':  np.random.randint(1,6,n),
-        'topic':        np.random.choice(TOPICS,n),
-        'speed':        np.clip(
-                            np.random.normal(cfg['speed'][scenario]['mean'], cfg['speed'][scenario]['sd'], n),
-                            0.1, None
-                        )
-    })
-    df[['x','y']] = pd.DataFrame(seats, index=df.index)
 
+    # Generate a DataFrame with student attributes and their seat locations
+    df = pd.DataFrame({
+        'student_id': np.arange(n),
+        'motivation': np.random.randint(1, 6, n),  # Motivation scores 1–5
+        'preparation': np.random.randint(1, 6, n),  # Preparation scores 1–5
+        'topic': np.random.choice(TOPICS, n),  # Randomly assigned topic
+        'speed': np.clip(
+            np.random.normal(cfg['speed'][scenario]['mean'],
+                             cfg['speed'][scenario]['sd'], n),
+            0.1, None)  # Walking speed, clipped to minimum 0.1
+    })
+    df[['x', 'y']] = pd.DataFrame(seats, index=df.index)  # Add seat positions
+
+    # Assign setup and group formation times based on process type
     if process in ('new', 'sim'):
         T_setup = max(0, np.random.normal(cfg['setup']['mean'], cfg['setup']['sd']))
         df['T_form_each'] = np.random.uniform(cfg['form']['low'], cfg['form']['high'], n)
@@ -288,6 +431,7 @@ def simulate(n, scenario, process, cfg, rooms, seed=None):
         assign_sp = max(0, np.random.normal(cfg['assign']['mean'], cfg['assign']['sd']))
         df['T_form_each'] = assign_sp
 
+    # Assign students to groups based on chosen process
     if process == 'new':
         students = df.to_dict('records')
         group_sizes = compute_group_sizes(len(students), 4)
@@ -301,16 +445,18 @@ def simulate(n, scenario, process, cfg, rooms, seed=None):
         gid_map = {student['student_id']: gid for gid, grp in enumerate(groups) for student in grp}
         df['group_id'] = df['student_id'].map(gid_map)
     else:
-        df['group_id'] = random_group_ids(n, cfg['group_sz'])
+        df['group_id'] = random_group_ids(n, cfg['group_sz'])  # Manual/random assignment
 
     df['T_setup'] = T_setup
-    df = compute_group_travel_time(df, scenario)
+    df = compute_group_travel_time(df, scenario)  # Calculate travel time per group
     df['T_total'] = df['T_setup'] + df['T_form_each'] + df['T_find']
 
-    df['scenario']   = scenario
-    df['process']    = process
+    # Add scenario/process context info
+    df['scenario'] = scenario
+    df['process'] = process
     df['n_students'] = n
 
+    # Calculate overall grouping time for the class (max of all per-student totals)
     if process in ('new', 'sim'):
         T_form = df['T_form_each'].max()
         T_move = df['T_find'].max()
@@ -320,6 +466,7 @@ def simulate(n, scenario, process, cfg, rooms, seed=None):
         T_grouping = assign_sp * n + T_move
 
     df['T_grouping'] = T_grouping
+
     return df
 
 # --- Estimate N_required from pilot (this section is fine) ---
